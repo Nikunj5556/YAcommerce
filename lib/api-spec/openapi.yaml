@@ -1,0 +1,335 @@
+openapi: 3.1.0
+info:
+  # Do not change the title, if the title changes, the import paths will be broken
+  title: Api
+  version: 0.1.0
+  description: YA Commerce API specification
+servers:
+  - url: /api
+    description: Base API path
+tags:
+  - name: health
+    description: Health operations
+  - name: auth
+    description: Authentication operations
+  - name: payment
+    description: Payment operations
+  - name: store
+    description: Store operations
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+  /auth/google/url:
+    get:
+      operationId: getGoogleAuthUrl
+      tags: [auth]
+      summary: Get Google OAuth URL
+      responses:
+        "200":
+          description: Google OAuth URL
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthUrl"
+  /auth/google/callback:
+    post:
+      operationId: googleAuthCallback
+      tags: [auth]
+      summary: Handle Google OAuth callback
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GoogleCallbackBody"
+      responses:
+        "200":
+          description: Auth session
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthSession"
+  /auth/email/send-otp:
+    post:
+      operationId: sendEmailOtp
+      tags: [auth]
+      summary: Send OTP to email via Brevo
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SendEmailOtpBody"
+      responses:
+        "200":
+          description: OTP sent
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OtpResponse"
+  /auth/email/verify-otp:
+    post:
+      operationId: verifyEmailOtp
+      tags: [auth]
+      summary: Verify email OTP
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VerifyEmailOtpBody"
+      responses:
+        "200":
+          description: Auth session
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthSession"
+  /auth/phone/send-otp:
+    post:
+      operationId: sendPhoneOtp
+      tags: [auth]
+      summary: Send OTP via WhatsApp
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SendPhoneOtpBody"
+      responses:
+        "200":
+          description: OTP sent
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OtpResponse"
+  /auth/phone/verify-otp:
+    post:
+      operationId: verifyPhoneOtp
+      tags: [auth]
+      summary: Verify phone OTP
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VerifyPhoneOtpBody"
+      responses:
+        "200":
+          description: Auth session
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthSession"
+  /payment/create-order:
+    post:
+      operationId: createPaymentOrder
+      tags: [payment]
+      summary: Create Razorpay order
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreatePaymentOrderBody"
+      responses:
+        "200":
+          description: Razorpay order created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaymentOrderResponse"
+  /payment/verify:
+    post:
+      operationId: verifyPayment
+      tags: [payment]
+      summary: Verify Razorpay payment
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VerifyPaymentBody"
+      responses:
+        "200":
+          description: Payment verified
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaymentVerifyResponse"
+  /store/settings:
+    get:
+      operationId: getStoreSettings
+      tags: [store]
+      summary: Get store settings
+      responses:
+        "200":
+          description: Store settings
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StoreSettings"
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      properties:
+        status:
+          type: string
+      required:
+        - status
+    AuthUrl:
+      type: object
+      properties:
+        url:
+          type: string
+      required:
+        - url
+    GoogleCallbackBody:
+      type: object
+      properties:
+        code:
+          type: string
+        redirectUri:
+          type: string
+      required:
+        - code
+        - redirectUri
+    AuthSession:
+      type: object
+      properties:
+        success:
+          type: boolean
+        session:
+          type: object
+        user:
+          type: object
+        error:
+          type: string
+      required:
+        - success
+    SendEmailOtpBody:
+      type: object
+      properties:
+        email:
+          type: string
+      required:
+        - email
+    VerifyEmailOtpBody:
+      type: object
+      properties:
+        email:
+          type: string
+        otp:
+          type: string
+      required:
+        - email
+        - otp
+    SendPhoneOtpBody:
+      type: object
+      properties:
+        phone:
+          type: string
+      required:
+        - phone
+    VerifyPhoneOtpBody:
+      type: object
+      properties:
+        phone:
+          type: string
+        otp:
+          type: string
+      required:
+        - phone
+        - otp
+    OtpResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        message:
+          type: string
+      required:
+        - success
+        - message
+    CreatePaymentOrderBody:
+      type: object
+      properties:
+        orderId:
+          type: string
+        amount:
+          type: number
+        currency:
+          type: string
+      required:
+        - orderId
+        - amount
+    VerifyPaymentBody:
+      type: object
+      properties:
+        razorpayOrderId:
+          type: string
+        razorpayPaymentId:
+          type: string
+        razorpaySignature:
+          type: string
+        orderId:
+          type: string
+      required:
+        - razorpayOrderId
+        - razorpayPaymentId
+        - razorpaySignature
+        - orderId
+    PaymentOrderResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        razorpayOrderId:
+          type: string
+        amount:
+          type: number
+        currency:
+          type: string
+        keyId:
+          type: string
+      required:
+        - success
+    PaymentVerifyResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        message:
+          type: string
+      required:
+        - success
+    StoreSettings:
+      type: object
+      properties:
+        storeName:
+          type: string
+        logoUrl:
+          type: string
+        supportEmail:
+          type: string
+        supportPhone:
+          type: string
+        codEnabled:
+          type: boolean
+        freeShippingAbove:
+          type: number
+        returnWindowDays:
+          type: integer
+        currency:
+          type: string
