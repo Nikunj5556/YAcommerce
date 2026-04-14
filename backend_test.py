@@ -135,6 +135,105 @@ class YACommerceAPITester:
             data={"phone": "9876543210", "otp": "000000"}
         )
 
+    def test_otp_verify_invalid_format(self):
+        """Test verifying OTP with invalid format (short OTP)"""
+        return self.run_test(
+            "Verify OTP (Invalid Format - Short)",
+            "POST",
+            "api/auth/email/verify-otp",
+            400,
+            data={"email": "test@example.com", "otp": "123"}
+        )
+
+    def test_rate_limiting(self):
+        """Test rate limiting - 6th request should return 429"""
+        test_email = f"ratelimit_test_{datetime.now().strftime('%H%M%S')}@example.com"
+        
+        print(f"\n🔍 Testing Rate Limiting with email: {test_email}")
+        
+        # Send 5 requests (should all succeed)
+        for i in range(5):
+            success, response = self.run_test(
+                f"Rate Limit Test {i+1}/5",
+                "POST",
+                "api/auth/email/send-otp",
+                200,
+                data={"email": test_email}
+            )
+            if not success:
+                print(f"❌ Rate limit test failed at request {i+1}")
+                return False, {}
+        
+        # 6th request should return 429
+        return self.run_test(
+            "Rate Limit Test 6/6 (Should be blocked)",
+            "POST",
+            "api/auth/email/send-otp",
+            429,
+            data={"email": test_email}
+        )
+
+    def test_email_otp_send_with_remaining_count(self):
+        """Test sending email OTP and check remaining_requests count"""
+        test_email = f"remaining_test_{datetime.now().strftime('%H%M%S')}@example.com"
+        success, response = self.run_test(
+            "Send Email OTP (Check Remaining Count)",
+            "POST",
+            "api/auth/email/send-otp",
+            200,
+            data={"email": test_email}
+        )
+        
+        if success and isinstance(response, dict):
+            remaining = response.get('remaining_requests')
+            if remaining is not None:
+                print(f"   ✅ Remaining requests: {remaining}")
+                return True, response
+            else:
+                print(f"   ❌ Missing 'remaining_requests' field in response")
+                self.failed_tests.append({
+                    "test": "Send Email OTP (Check Remaining Count)",
+                    "error": "Missing 'remaining_requests' field"
+                })
+                return False, response
+        
+        return success, response
+
+    def test_email_otp_wrong_attempts(self):
+        """Test email OTP verification with wrong OTP to check attempts remaining"""
+        test_email = f"attempts_test_{datetime.now().strftime('%H%M%S')}@example.com"
+        
+        # First send OTP
+        success, _ = self.run_test(
+            "Send Email OTP for Attempts Test",
+            "POST",
+            "api/auth/email/send-otp",
+            200,
+            data={"email": test_email}
+        )
+        
+        if not success:
+            return False, {}
+        
+        # Try wrong OTP - should get error with attempts remaining
+        success, response = self.run_test(
+            "Verify Email OTP (Wrong OTP - Check Attempts)",
+            "POST",
+            "api/auth/email/verify-otp",
+            400,
+            data={"email": test_email, "otp": "999999"}
+        )
+        
+        if success and isinstance(response, dict):
+            error_msg = response.get('detail', '')
+            if 'attempt' in error_msg.lower():
+                print(f"   ✅ Error message includes attempts info: {error_msg}")
+                return True, response
+            else:
+                print(f"   ❌ Error message doesn't include attempts info: {error_msg}")
+        
+        return success, response
+
 def main():
     print("🚀 Starting YA Commerce Backend API Tests")
     print("=" * 50)
@@ -145,12 +244,17 @@ def main():
     tester.test_health_endpoint()
 
     # Test auth endpoints
-    tester.test_email_otp_send()
+    tester.test_email_otp_send_with_remaining_count()
     tester.test_email_otp_send_invalid()
     tester.test_phone_otp_send()
     tester.test_phone_otp_send_invalid()
     tester.test_email_otp_verify_invalid()
     tester.test_phone_otp_verify_invalid()
+    tester.test_otp_verify_invalid_format()
+    tester.test_email_otp_wrong_attempts()
+    
+    # Test rate limiting (this should be last as it blocks the email)
+    tester.test_rate_limiting()
 
     # Print results
     print("\n" + "=" * 50)

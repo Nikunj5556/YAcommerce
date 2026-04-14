@@ -3,7 +3,7 @@ import hashlib
 import secrets
 import hmac
 import time
-import json
+import base64
 import logging
 from datetime import datetime, timezone, timedelta
 
@@ -11,7 +11,7 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 from supabase import create_client
 
 load_dotenv()
@@ -43,53 +43,513 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Rate limiting (in-memory) ─────────────────────────────────
-rate_limits: dict = {}
 
-def check_rate_limit(identifier: str, max_requests: int = 5, window_seconds: int = 300) -> bool:
-    now = time.time()
-    key = f"rl:{identifier}"
-    record = rate_limits.get(key)
-    if not record or now > record["reset"]:
-        rate_limits[key] = {"count": 1, "reset": now + window_seconds}
-        return True
-    if record["count"] >= max_requests:
-        return False
-    record["count"] += 1
-    return True
+# ══════════════════════════════════════════════════════════════
+# OTP MODULE — Supabase-backed (temp_otp + auth_rate_limit)
+#   Falls back to in-memory if tables don't exist yet.
+# ══════════════════════════════════════════════════════════════
 
-# ── OTP helpers ───────────────────────────────────────────────
-def generate_otp() -> str:
+OTP_EXPIRY_MINUTES = 5
+OTP_MAX_ATTEMPTS = 5
+RATE_LIMIT_MAX_REQUESTS = 5
+RATE_LIMIT_WINDOW_MINUTES = 10
+RATE_LIMIT_BLOCK_MINUTES = 30
+
+# ── Detect whether Supabase tables exist ──────────────────────
+_USE_SUPABASE_OTP = None  # None = not checked, True/False after check
+
+def _tables_available() -> bool:
+    global _USE_SUPABASE_OTP
+    if _USE_SUPABASE_OTP is not None:
+        return _USE_SUPABASE_OTP
+    try:
+        res = supabase.table("temp_otp").select("id").limit(0).execute()  # noqa: F841
+        _USE_SUPABASE_OTP = True
+        logger.info("temp_otp table detected — using Supabase OTP storage")
+    except Exception:
+        _USE_SUPABASE_OTP = False
+        logger.info("temp_otp table NOT found — using in-memory OTP storage")
+    return _USE_SUPABASE_OTP
+
+# ── In-memory fallback stores ─────────────────────────────────
+_mem_otps: dict = {}      # key: "purpose:identifier" -> {otp_hash, expires_at, attempts, consumed}
+_mem_rate: dict = {}      # key: "action:identifier" -> {count, window_end, blocked_until}
+
+
+def _generate_otp() -> str:
+    """Cryptographically secure 6-digit OTP."""
     return str(secrets.randbelow(900000) + 100000)
 
-def hash_otp(otp: str) -> str:
-    return hashlib.sha256(otp.encode()).hexdigest()
 
-# In-memory OTP store (fallback when temp_otps table doesn't exist)
-otp_store: dict = {}
+def _hash_otp(otp: str) -> str:
+    """SHA-256 hash — never store plain text."""
+    return hashlib.sha256(otp.encode("utf-8")).hexdigest()
 
-def store_otp(identifier: str, otp_type: str, otp_hash: str):
-    otp_store[f"{otp_type}:{identifier}"] = {
-        "otp_hash": otp_hash,
-        "expires_at": datetime.now(timezone.utc) + timedelta(minutes=5),
-        "attempts": 0,
-    }
 
-def get_otp(identifier: str, otp_type: str):
-    return otp_store.get(f"{otp_type}:{identifier}")
+def _extract_client_info(request: Request) -> tuple[str | None, str | None]:
+    """Pull IP and User-Agent from the incoming request."""
+    ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or request.client.host if request.client else None
+    ua = request.headers.get("user-agent")
+    return ip, ua
 
-def delete_otp(identifier: str, otp_type: str):
-    otp_store.pop(f"{otp_type}:{identifier}", None)
 
-def increment_otp_attempts(identifier: str, otp_type: str):
-    key = f"{otp_type}:{identifier}"
-    if key in otp_store:
-        otp_store[key]["attempts"] += 1
+# ── Rate Limiter (Supabase auth_rate_limit table) ────────────
+
+def _check_rate_limit(
+    identifier: str,
+    identifier_type: str,
+    action: str,
+    ip_address: str | None,
+    max_requests: int = RATE_LIMIT_MAX_REQUESTS,
+    window_minutes: int = RATE_LIMIT_WINDOW_MINUTES,
+) -> dict:
+    """
+    Returns {"allowed": bool, "remaining": int, "blocked_until": str|None}.
+    Uses Supabase auth_rate_limit table, or in-memory fallback.
+    """
+    if not _tables_available():
+        return _check_rate_limit_mem(identifier, action, max_requests, window_minutes)
+
+    now = datetime.now(timezone.utc)
+
+    # 1) Check if currently blocked
+    try:
+        blocked_res = (
+            supabase.table("auth_rate_limit")
+            .select("blocked_until")
+            .eq("identifier", identifier)
+            .eq("action", action)
+            .not_.is_("blocked_until", "null")
+            .gte("blocked_until", now.isoformat())
+            .order("blocked_until", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if blocked_res.data and blocked_res.data[0].get("blocked_until"):
+            return {
+                "allowed": False,
+                "remaining": 0,
+                "blocked_until": blocked_res.data[0]["blocked_until"],
+            }
+    except Exception as e:
+        logger.warning(f"Rate limit blocked check: {e}")
+
+    # 2) Find or create the current window
+    window_start = now - timedelta(minutes=window_minutes)
+
+    try:
+        window_res = (
+            supabase.table("auth_rate_limit")
+            .select("*")
+            .eq("identifier", identifier)
+            .eq("action", action)
+            .gte("window_start", window_start.isoformat())
+            .order("window_start", desc=True)
+            .limit(1)
+            .execute()
+        )
+    except Exception as e:
+        logger.warning(f"Rate limit window check: {e}")
+        # Fail open — allow the request if we can't check
+        return {"allowed": True, "remaining": max_requests, "blocked_until": None}
+
+    if window_res.data:
+        record = window_res.data[0]
+        count = record.get("request_count", 0)
+
+        if count >= max_requests:
+            # Block the user
+            blocked_until = (now + timedelta(minutes=RATE_LIMIT_BLOCK_MINUTES)).isoformat()
+            try:
+                supabase.table("auth_rate_limit").update({
+                    "blocked_until": blocked_until,
+                    "updated_at": now.isoformat(),
+                }).eq("id", record["id"]).execute()
+            except Exception as e:
+                logger.warning(f"Rate limit block update: {e}")
+
+            return {"allowed": False, "remaining": 0, "blocked_until": blocked_until}
+
+        # Increment
+        try:
+            supabase.table("auth_rate_limit").update({
+                "request_count": count + 1,
+                "updated_at": now.isoformat(),
+            }).eq("id", record["id"]).execute()
+        except Exception as e:
+            logger.warning(f"Rate limit increment: {e}")
+
+        return {"allowed": True, "remaining": max_requests - count - 1, "blocked_until": None}
+
+    else:
+        # First request in this window — insert
+        window_end = (now + timedelta(minutes=window_minutes)).isoformat()
+        try:
+            supabase.table("auth_rate_limit").insert({
+                "identifier": identifier,
+                "identifier_type": identifier_type,
+                "ip_address": ip_address,
+                "action": action,
+                "request_count": 1,
+                "window_start": now.isoformat(),
+                "window_end": window_end,
+            }).execute()
+        except Exception as e:
+            logger.warning(f"Rate limit insert: {e}")
+
+        return {"allowed": True, "remaining": max_requests - 1, "blocked_until": None}
+
+
+# ── In-memory fallback: rate limit ────────────────────────────
+
+def _check_rate_limit_mem(identifier: str, action: str, max_req: int, window_min: int) -> dict:
+    now = datetime.now(timezone.utc)
+    key = f"{action}:{identifier}"
+    rec = _mem_rate.get(key)
+    if rec and rec.get("blocked_until") and rec["blocked_until"] > now:
+        return {"allowed": False, "remaining": 0, "blocked_until": rec["blocked_until"].isoformat()}
+    if not rec or rec["window_end"] < now:
+        _mem_rate[key] = {"count": 1, "window_end": now + timedelta(minutes=window_min), "blocked_until": None}
+        return {"allowed": True, "remaining": max_req - 1, "blocked_until": None}
+    if rec["count"] >= max_req:
+        rec["blocked_until"] = now + timedelta(minutes=RATE_LIMIT_BLOCK_MINUTES)
+        return {"allowed": False, "remaining": 0, "blocked_until": rec["blocked_until"].isoformat()}
+    rec["count"] += 1
+    return {"allowed": True, "remaining": max_req - rec["count"], "blocked_until": None}
+
+
+# ── OTP Store (Supabase temp_otp table) ──────────────────────
+
+def _store_otp(
+    identifier: str,
+    identifier_type: str,
+    otp_hash: str,
+    purpose: str,
+    ip_address: str | None,
+    user_agent: str | None,
+):
+    """Upsert OTP into temp_otp (Supabase) or in-memory fallback."""
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(minutes=OTP_EXPIRY_MINUTES)
+
+    if not _tables_available():
+        _mem_otps[f"{purpose}:{identifier}"] = {
+            "otp_hash": otp_hash,
+            "expires_at": expires_at,
+            "attempts": 0,
+            "max_attempts": OTP_MAX_ATTEMPTS,
+            "consumed": False,
+        }
+        return
+
+    # Delete any existing OTP for this identifier+purpose first
+    try:
+        supabase.table("temp_otp").delete().eq("identifier", identifier).eq("purpose", purpose).execute()
+    except Exception:
+        pass
+
+    try:
+        supabase.table("temp_otp").insert({
+            "identifier": identifier,
+            "identifier_type": identifier_type,
+            "otp_hash": otp_hash,
+            "purpose": purpose,
+            "attempts": 0,
+            "max_attempts": OTP_MAX_ATTEMPTS,
+            "expires_at": expires_at.isoformat(),
+            "consumed": False,
+            "ip_address": ip_address,
+            "user_agent": user_agent,
+        }).execute()
+    except Exception as e:
+        logger.error(f"OTP store insert: {e}")
+        raise HTTPException(500, "Failed to generate verification code")
+
+
+def _get_otp(identifier: str, purpose: str) -> dict | None:
+    """Fetch the latest, unconsumed, non-expired OTP."""
+    now = datetime.now(timezone.utc)
+
+    if not _tables_available():
+        rec = _mem_otps.get(f"{purpose}:{identifier}")
+        if not rec or rec["consumed"] or rec["expires_at"] < now:
+            return None
+        return {**rec, "id": f"{purpose}:{identifier}"}
+
+    try:
+        res = (
+            supabase.table("temp_otp")
+            .select("*")
+            .eq("identifier", identifier)
+            .eq("purpose", purpose)
+            .eq("consumed", False)
+            .gte("expires_at", now.isoformat())
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        return res.data[0] if res.data else None
+    except Exception as e:
+        logger.error(f"OTP fetch: {e}")
+        return None
+
+
+def _consume_otp(otp_id: str):
+    """Mark OTP as consumed (one-time use)."""
+    if not _tables_available():
+        if otp_id in _mem_otps:
+            _mem_otps[otp_id]["consumed"] = True
+        return
+    try:
+        supabase.table("temp_otp").update({"consumed": True}).eq("id", otp_id).execute()
+    except Exception as e:
+        logger.warning(f"OTP consume: {e}")
+
+
+def _increment_otp_attempts(otp_id: str, current_attempts: int):
+    """Increment failed-attempt counter."""
+    if not _tables_available():
+        if otp_id in _mem_otps:
+            _mem_otps[otp_id]["attempts"] = current_attempts + 1
+        return
+    try:
+        supabase.table("temp_otp").update({"attempts": current_attempts + 1}).eq("id", otp_id).execute()
+    except Exception as e:
+        logger.warning(f"OTP attempt increment: {e}")
+
+
+def _cleanup_expired_otps():
+    """Best-effort housekeeping."""
+    if not _tables_available():
+        now = datetime.now(timezone.utc)
+        expired = [k for k, v in _mem_otps.items() if v["expires_at"] < now]
+        for k in expired:
+            del _mem_otps[k]
+        return
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    try:
+        supabase.table("temp_otp").delete().lt("expires_at", cutoff).execute()
+    except Exception:
+        pass
+
+
+# ── Public API: sendOtp / verifyOtp ───────────────────────────
+
+async def send_otp(
+    identifier: str,
+    identifier_type: str,   # 'email' | 'phone'
+    purpose: str,            # 'login' | 'signup' | 'verify_phone' | ...
+    request: Request,
+) -> dict:
+    """
+    Full send-OTP flow:
+      1. Rate-limit check
+      2. Generate + hash OTP
+      3. Store in temp_otp
+      4. Dispatch via Brevo (email) or WhatsApp (phone)
+      5. Return success/failure
+    """
+    ip, ua = _extract_client_info(request)
+
+    # ── Rate limit ─────────────────────────────────────────
+    rl = _check_rate_limit(identifier, identifier_type, "send_otp", ip)
+    if not rl["allowed"]:
+        blocked_msg = ""
+        if rl.get("blocked_until"):
+            blocked_msg = f" Try again after {rl['blocked_until'][:16].replace('T', ' ')} UTC."
+        raise HTTPException(429, f"Too many requests.{blocked_msg}")
+
+    # ── Generate & store ───────────────────────────────────
+    plain_otp = _generate_otp()
+    otp_hash = _hash_otp(plain_otp)
+    _store_otp(identifier, identifier_type, otp_hash, purpose, ip, ua)
+
+    # ── Dispatch ───────────────────────────────────────────
+    if identifier_type == "email":
+        await _send_otp_email(identifier, plain_otp)
+    elif identifier_type == "phone":
+        await _send_otp_whatsapp(identifier, plain_otp)
+        # Also try email fallback if customer has email
+        await _send_otp_phone_email_fallback(identifier, plain_otp)
+
+    # Cleanup old entries (fire-and-forget)
+    _cleanup_expired_otps()
+
+    channel = "email" if identifier_type == "email" else "WhatsApp"
+    return {"success": True, "message": f"Verification code sent via {channel}", "remaining_requests": rl["remaining"]}
+
+
+def verify_otp(
+    identifier: str,
+    identifier_type: str,
+    purpose: str,
+    plain_otp: str,
+    request: Request,
+) -> dict:
+    """
+    Full verify-OTP flow:
+      1. Rate-limit check on verify action
+      2. Fetch latest OTP
+      3. Check expiry, consumed, attempts
+      4. Compare hash
+      5. Mark consumed or increment attempts
+    """
+    ip, ua = _extract_client_info(request)
+
+    # ── Rate limit on verification attempts ────────────────
+    rl = _check_rate_limit(identifier, identifier_type, "verify_otp", ip)
+    if not rl["allowed"]:
+        raise HTTPException(429, "Too many verification attempts. Please try again later.")
+
+    # ── Fetch OTP record ───────────────────────────────────
+    record = _get_otp(identifier, purpose)
+    if not record:
+        raise HTTPException(400, "No valid verification code found. Please request a new one.")
+
+    # ── Expiry check (defense in depth — query already filters) ──
+    expires_at_str = record["expires_at"]
+    if isinstance(expires_at_str, str):
+        expires_at = datetime.fromisoformat(expires_at_str.replace("Z", "+00:00"))
+    else:
+        expires_at = expires_at_str
+    if expires_at < datetime.now(timezone.utc):
+        _consume_otp(record["id"])
+        raise HTTPException(400, "Verification code has expired. Please request a new one.")
+
+    # ── Already consumed ───────────────────────────────────
+    if record.get("consumed"):
+        raise HTTPException(400, "This code has already been used. Please request a new one.")
+
+    # ── Max attempts ───────────────────────────────────────
+    attempts = record.get("attempts", 0)
+    max_att = record.get("max_attempts", OTP_MAX_ATTEMPTS)
+    if attempts >= max_att:
+        _consume_otp(record["id"])
+        # Also temporarily block
+        _check_rate_limit(identifier, identifier_type, "verify_otp", ip, max_requests=0, window_minutes=1)
+        raise HTTPException(400, "Too many failed attempts. Please request a new code.")
+
+    # ── Hash comparison ────────────────────────────────────
+    incoming_hash = _hash_otp(plain_otp)
+    if incoming_hash != record["otp_hash"]:
+        _increment_otp_attempts(record["id"], attempts)
+        remaining = max_att - attempts - 1
+        raise HTTPException(400, f"Invalid code. {remaining} attempt{'s' if remaining != 1 else ''} remaining.")
+
+    # ── Success — mark consumed ────────────────────────────
+    _consume_otp(record["id"])
+
+    return {"success": True, "verified": True}
+
+
+# ── Email dispatch via Brevo ──────────────────────────────────
+
+async def _send_otp_email(email: str, otp: str):
+    html = f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;color:#333">
+    <div style="max-width:600px;margin:0 auto;padding:20px">
+    <h2 style="margin:0 0 8px">Your Verification Code</h2>
+    <p style="margin:0 0 20px;color:#555">Use this code to sign in to YA Commerce:</p>
+    <div style="background:#000;color:#fff;padding:24px;text-align:center;border-radius:4px;margin:0 0 20px">
+    <div style="font-size:36px;font-weight:bold;letter-spacing:10px;font-family:monospace">{otp}</div></div>
+    <p style="margin:0 0 4px;font-size:14px;color:#555">This code expires in {OTP_EXPIRY_MINUTES} minutes.</p>
+    <p style="font-size:13px;color:#999">If you didn't request this, ignore this email.</p>
+    <hr style="border:0;border-top:1px solid #eee;margin:24px 0 12px">
+    <p style="font-size:11px;color:#aaa;margin:0">YA Commerce &mdash; Premium E-Commerce</p>
+    </div></body></html>"""
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(
+            "https://api.brevo.com/v3/smtp/email",
+            headers={"api-key": BREVO_API_KEY, "Content-Type": "application/json"},
+            json={
+                "sender": {"name": "YA Commerce", "email": BREVO_SENDER_EMAIL},
+                "to": [{"email": email}],
+                "subject": "Your Verification Code - YA Commerce",
+                "htmlContent": html,
+            },
+        )
+        if resp.status_code >= 400:
+            logger.error(f"Brevo error [{resp.status_code}]: {resp.text}")
+            raise HTTPException(500, "Failed to send verification email")
+
+
+# ── WhatsApp dispatch via Meta Business API ───────────────────
+
+async def _send_otp_whatsapp(phone: str, otp: str):
+    if (
+        not META_WHATSAPP_PHONE_NUMBER_ID
+        or not META_WHATSAPP_ACCESS_TOKEN
+        or META_WHATSAPP_PHONE_NUMBER_ID == "PLACEHOLDER_PHONE_NUMBER_ID"
+    ):
+        logger.info(f"WhatsApp not configured — OTP for {phone}: {otp}")
+        return
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(
+            f"https://graph.facebook.com/v18.0/{META_WHATSAPP_PHONE_NUMBER_ID}/messages",
+            headers={
+                "Authorization": f"Bearer {META_WHATSAPP_ACCESS_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "messaging_product": "whatsapp",
+                "to": f"91{phone}",
+                "type": "text",
+                "text": {
+                    "body": (
+                        f"Your YA Commerce verification code is: {otp}\n\n"
+                        f"This code expires in {OTP_EXPIRY_MINUTES} minutes.\n"
+                        "Do not share this code with anyone."
+                    )
+                },
+            },
+        )
+        if resp.status_code >= 400:
+            logger.warning(f"WhatsApp API error [{resp.status_code}]: {resp.text}")
+
+
+async def _send_otp_phone_email_fallback(phone: str, otp: str):
+    """If the phone user already has a real email, also send OTP there."""
+    try:
+        res = supabase.table("customers").select("email").eq("phone", phone).maybe_single().execute()
+        if (
+            res.data
+            and res.data.get("email")
+            and "@" in res.data["email"]
+            and "@yacommerce" not in res.data["email"]
+        ):
+            await _send_otp_email(res.data["email"], otp)
+    except Exception as e:
+        logger.warning(f"Phone email fallback: {e}")
+
+
+# ══════════════════════════════════════════════════════════════
+# HELPER: normalize phone
+# ══════════════════════════════════════════════════════════════
+
+def normalize_phone(phone: str) -> str:
+    p = phone.replace(" ", "").replace("-", "")
+    if p.startswith("+91"):
+        p = p[3:]
+    elif p.startswith("91") and len(p) == 12:
+        p = p[2:]
+    return p
+
+
+# ══════════════════════════════════════════════════════════════
+# ROUTES
+# ══════════════════════════════════════════════════════════════
+
 
 # ── Health ────────────────────────────────────────────────────
+
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "service": "YA Commerce API", "timestamp": datetime.now(timezone.utc).isoformat()}
+    return {
+        "status": "ok",
+        "service": "YA Commerce API",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 # ══════════════════════════════════════════════════════════════
@@ -98,96 +558,64 @@ async def health():
 
 class EmailOTPRequest(BaseModel):
     email: str
+    purpose: str = "login"
 
 class EmailVerifyRequest(BaseModel):
     email: str
     otp: str
+    purpose: str = "login"
+
 
 @app.post("/api/auth/email/send-otp")
-async def send_email_otp(req: EmailOTPRequest):
+async def route_send_email_otp(req: EmailOTPRequest, request: Request):
     email = req.email.strip().lower()
     if not email or "@" not in email:
         raise HTTPException(400, "Invalid email address")
-    if not check_rate_limit(f"email:{email}", 3, 300):
-        raise HTTPException(429, "Too many requests. Please try again later.")
 
-    otp = generate_otp()
-    hashed = hash_otp(otp)
-
-    store_otp(email, "email", hashed)
-
-    html = f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;color:#333">
-    <div style="max-width:600px;margin:0 auto;padding:20px">
-    <h2>Your Login Code</h2><p>Use this code to sign in to YA Commerce:</p>
-    <div style="background:#000;color:#fff;padding:20px;text-align:center;border-radius:4px;margin:20px 0">
-    <div style="font-size:32px;font-weight:bold;letter-spacing:8px">{otp}</div></div>
-    <p>This code expires in 5 minutes.</p>
-    <p style="color:#666;font-size:12px;margin-top:30px;border-top:1px solid #ddd;padding-top:20px">YA Commerce</p>
-    </div></body></html>"""
-
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            "https://api.brevo.com/v3/smtp/email",
-            headers={"api-key": BREVO_API_KEY, "Content-Type": "application/json"},
-            json={
-                "sender": {"name": "YA Commerce", "email": BREVO_SENDER_EMAIL},
-                "to": [{"email": email}],
-                "subject": "Your Login Code - YA Commerce",
-                "htmlContent": html,
-            },
-        )
-        if resp.status_code >= 400:
-            logger.error(f"Brevo error: {resp.text}")
-            raise HTTPException(500, "Failed to send email")
-
-    return {"success": True, "message": "OTP sent to your email"}
+    result = await send_otp(
+        identifier=email,
+        identifier_type="email",
+        purpose=req.purpose,
+        request=request,
+    )
+    return result
 
 
 @app.post("/api/auth/email/verify-otp")
-async def verify_email_otp(req: EmailVerifyRequest):
+async def route_verify_email_otp(req: EmailVerifyRequest, request: Request):
     email = req.email.strip().lower()
     otp = req.otp.strip()
     if not email or not otp or len(otp) != 6:
-        raise HTTPException(400, "Invalid email or OTP")
+        raise HTTPException(400, "Invalid email or verification code")
 
-    hashed = hash_otp(otp)
-    record = get_otp(email, "email")
-    if not record:
-        raise HTTPException(400, "Invalid or expired OTP")
-    if record["expires_at"] < datetime.now(timezone.utc):
-        delete_otp(email, "email")
-        raise HTTPException(400, "OTP has expired")
-    if record["attempts"] >= 3:
-        delete_otp(email, "email")
-        raise HTTPException(400, "Too many failed attempts")
-    if record["otp_hash"] != hashed:
-        increment_otp_attempts(email, "email")
-        raise HTTPException(400, "Invalid OTP")
+    verify_otp(
+        identifier=email,
+        identifier_type="email",
+        purpose=req.purpose,
+        plain_otp=otp,
+        request=request,
+    )
 
-    delete_otp(email, "email")
-
-    # Check/create customer
+    # ── OTP verified — create / link Supabase Auth user ───
     cust_res = supabase.table("customers").select("*").eq("email", email).maybe_single().execute()
     customer = cust_res.data
 
     if not customer:
-        # Use Supabase Auth admin API to create user
         try:
             auth_resp = supabase.auth.admin.create_user({
                 "email": email,
                 "email_confirm": True,
-                "user_metadata": {"email_verified": True}
+                "user_metadata": {"email_verified": True},
             })
             user_id = auth_resp.user.id
             supabase.table("customers").insert({
                 "user_id": str(user_id),
                 "email": email,
                 "email_verified": True,
-                "phone_verified": False
+                "phone_verified": False,
             }).execute()
         except Exception as e:
             logger.error(f"User creation error: {e}")
-            # Try to get existing auth user
             try:
                 users = supabase.auth.admin.list_users()
                 existing = next((u for u in users if u.email == email), None)
@@ -197,10 +625,12 @@ async def verify_email_otp(req: EmailVerifyRequest):
                         "user_id": str(user_id),
                         "email": email,
                         "email_verified": True,
-                        "phone_verified": False
+                        "phone_verified": False,
                     }).execute()
                 else:
                     raise HTTPException(500, "Failed to create user")
+            except HTTPException:
+                raise
             except Exception:
                 raise HTTPException(500, "Failed to create user")
     else:
@@ -214,14 +644,21 @@ async def verify_email_otp(req: EmailVerifyRequest):
                     "email_confirm": True,
                 })
                 user_id = auth_resp.user.id
-                supabase.table("customers").update({"user_id": str(user_id), "email_verified": True}).eq("email", email).execute()
+                supabase.table("customers").update({
+                    "user_id": str(user_id),
+                    "email_verified": True,
+                }).eq("email", email).execute()
             except Exception:
                 raise HTTPException(500, "Failed to link user")
 
     # Generate magic link for session
     try:
         link_resp = supabase.auth.admin.generate_link({"type": "magiclink", "email": email})
-        return {"success": True, "session": {"properties": {"hashed_token": link_resp.properties.hashed_token if hasattr(link_resp, 'properties') else None}, "email": email}}
+        hashed_token = link_resp.properties.hashed_token if hasattr(link_resp, "properties") else None
+        return {
+            "success": True,
+            "session": {"properties": {"hashed_token": hashed_token}, "email": email},
+        }
     except Exception as e:
         logger.error(f"Link generation error: {e}")
         return {"success": True, "message": "Verified. Please sign in."}
@@ -233,92 +670,45 @@ async def verify_email_otp(req: EmailVerifyRequest):
 
 class PhoneOTPRequest(BaseModel):
     phone: str
+    purpose: str = "login"
 
 class PhoneVerifyRequest(BaseModel):
     phone: str
     otp: str
+    purpose: str = "login"
 
-def normalize_phone(phone: str) -> str:
-    p = phone.replace(" ", "").replace("-", "")
-    if p.startswith("+91"):
-        p = p[3:]
-    elif p.startswith("91") and len(p) == 12:
-        p = p[2:]
-    return p
 
 @app.post("/api/auth/phone/send-otp")
-async def send_phone_otp(req: PhoneOTPRequest):
+async def route_send_phone_otp(req: PhoneOTPRequest, request: Request):
     phone = normalize_phone(req.phone)
     if len(phone) != 10 or not phone.isdigit():
         raise HTTPException(400, "Invalid phone number")
-    if not check_rate_limit(f"phone:{phone}", 3, 300):
-        raise HTTPException(429, "Too many requests. Please try again later.")
 
-    otp = generate_otp()
-    hashed = hash_otp(otp)
-
-    store_otp(phone, "phone", hashed)
-
-    # Send via Meta WhatsApp Business API
-    if META_WHATSAPP_PHONE_NUMBER_ID and META_WHATSAPP_ACCESS_TOKEN and META_WHATSAPP_PHONE_NUMBER_ID != "PLACEHOLDER_PHONE_NUMBER_ID":
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                f"https://graph.facebook.com/v18.0/{META_WHATSAPP_PHONE_NUMBER_ID}/messages",
-                headers={"Authorization": f"Bearer {META_WHATSAPP_ACCESS_TOKEN}", "Content-Type": "application/json"},
-                json={
-                    "messaging_product": "whatsapp",
-                    "to": f"91{phone}",
-                    "type": "text",
-                    "text": {"body": f"Your YA Commerce login code is: {otp}\n\nThis code expires in 5 minutes.\nDo not share this code."}
-                }
-            )
-            if resp.status_code >= 400:
-                logger.warning(f"WhatsApp API error: {resp.text}")
-
-    # Also send via Brevo email if customer has email
-    try:
-        cust_res = supabase.table("customers").select("email").eq("phone", phone).maybe_single().execute()
-        if cust_res.data and cust_res.data.get("email") and "@" in cust_res.data["email"] and "@yacommerce" not in cust_res.data["email"]:
-            async with httpx.AsyncClient() as client:
-                await client.post(
-                    "https://api.brevo.com/v3/smtp/email",
-                    headers={"api-key": BREVO_API_KEY, "Content-Type": "application/json"},
-                    json={
-                        "sender": {"name": "YA Commerce", "email": BREVO_SENDER_EMAIL},
-                        "to": [{"email": cust_res.data["email"]}],
-                        "subject": "Your Phone Verification Code - YA Commerce",
-                        "htmlContent": f"<h2>Your code: <strong>{otp}</strong></h2><p>Expires in 5 minutes.</p>",
-                    }
-                )
-    except Exception as e:
-        logger.warning(f"Email fallback error: {e}")
-
-    return {"success": True, "message": "OTP sent via WhatsApp"}
+    result = await send_otp(
+        identifier=phone,
+        identifier_type="phone",
+        purpose=req.purpose,
+        request=request,
+    )
+    return result
 
 
 @app.post("/api/auth/phone/verify-otp")
-async def verify_phone_otp(req: PhoneVerifyRequest):
+async def route_verify_phone_otp(req: PhoneVerifyRequest, request: Request):
     phone = normalize_phone(req.phone)
     otp = req.otp.strip()
     if len(phone) != 10 or not otp or len(otp) != 6:
-        raise HTTPException(400, "Invalid phone or OTP")
+        raise HTTPException(400, "Invalid phone or verification code")
 
-    hashed = hash_otp(otp)
-    record = get_otp(phone, "phone")
-    if not record:
-        raise HTTPException(400, "Invalid or expired OTP")
-    if record["expires_at"] < datetime.now(timezone.utc):
-        delete_otp(phone, "phone")
-        raise HTTPException(400, "OTP has expired")
-    if record["attempts"] >= 3:
-        delete_otp(phone, "phone")
-        raise HTTPException(400, "Too many failed attempts")
-    if record["otp_hash"] != hashed:
-        increment_otp_attempts(phone, "phone")
-        raise HTTPException(400, "Invalid OTP")
+    verify_otp(
+        identifier=phone,
+        identifier_type="phone",
+        purpose=req.purpose,
+        plain_otp=otp,
+        request=request,
+    )
 
-    delete_otp(phone, "phone")
-
+    # ── OTP verified — create / link Supabase Auth user ───
     cust_res = supabase.table("customers").select("*").eq("phone", phone).maybe_single().execute()
     customer = cust_res.data
 
@@ -349,8 +739,10 @@ async def verify_phone_otp(req: PhoneVerifyRequest):
         if not user_id:
             try:
                 auth_resp = supabase.auth.admin.create_user({
-                    "email": email, "email_confirm": bool("@yacommerce" not in email),
-                    "phone": f"+91{phone}", "phone_confirm": True,
+                    "email": email,
+                    "email_confirm": bool("@yacommerce" not in email),
+                    "phone": f"+91{phone}",
+                    "phone_confirm": True,
                 })
                 user_id = auth_resp.user.id
                 supabase.table("customers").update({"user_id": str(user_id)}).eq("phone", phone).execute()
@@ -359,7 +751,12 @@ async def verify_phone_otp(req: PhoneVerifyRequest):
 
     try:
         link_resp = supabase.auth.admin.generate_link({"type": "magiclink", "email": email})
-        return {"success": True, "phone_verified": True, "session": {"properties": {"hashed_token": link_resp.properties.hashed_token if hasattr(link_resp, 'properties') else None}, "email": email}}
+        hashed_token = link_resp.properties.hashed_token if hasattr(link_resp, "properties") else None
+        return {
+            "success": True,
+            "phone_verified": True,
+            "session": {"properties": {"hashed_token": hashed_token}, "email": email},
+        }
     except Exception as e:
         logger.error(f"Link gen: {e}")
         return {"success": True, "phone_verified": True}
@@ -392,15 +789,15 @@ class VerifyPaymentRequest(BaseModel):
     razorpay_signature: str
     order_id: str | None = None
 
+
 @app.post("/api/payment/create-order")
 async def create_payment_order(req: CreatePaymentRequest):
     if req.amount <= 0:
         raise HTTPException(400, "Invalid amount")
 
-    import base64
     auth = base64.b64encode(f"{RAZORPAY_KEY_ID}:{RAZORPAY_KEY_SECRET}".encode()).decode()
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(
             "https://api.razorpay.com/v1/orders",
             headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"},
@@ -409,7 +806,7 @@ async def create_payment_order(req: CreatePaymentRequest):
                 "currency": req.currency,
                 "receipt": f"rcpt_{req.order_id or int(time.time())}",
                 "notes": {"customer_id": req.customer_id, "order_id": req.order_id or ""},
-            }
+            },
         )
         if resp.status_code >= 400:
             logger.error(f"Razorpay error: {resp.text}")
@@ -426,7 +823,7 @@ async def create_payment_order(req: CreatePaymentRequest):
 
 
 @app.post("/api/payment/verify")
-async def verify_payment(req: VerifyPaymentRequest):
+async def verify_razorpay(req: VerifyPaymentRequest):
     generated = hmac.new(
         RAZORPAY_KEY_SECRET.encode(),
         f"{req.razorpay_order_id}|{req.razorpay_payment_id}".encode(),
@@ -453,7 +850,10 @@ async def verify_payment(req: VerifyPaymentRequest):
                 "paid_amount": 0,
                 "payment_timestamp": datetime.now(timezone.utc).isoformat(),
                 "is_cod": False,
-                "gateway_response": {"razorpay_payment_id": req.razorpay_payment_id, "razorpay_order_id": req.razorpay_order_id},
+                "gateway_response": {
+                    "razorpay_payment_id": req.razorpay_payment_id,
+                    "razorpay_order_id": req.razorpay_order_id,
+                },
             }).execute()
 
             supabase.table("order_events").insert({
@@ -485,25 +885,22 @@ class CreateOrderRequest(BaseModel):
     payment_mode: str = "online"
     coupon_code: str | None = None
 
+
 @app.post("/api/order/create")
 async def create_order(req: CreateOrderRequest):
-    # Verify customer
     cust = supabase.table("customers").select("*").eq("id", req.customer_id).maybe_single().execute()
     if not cust.data:
         raise HTTPException(404, "Customer not found")
 
-    # Get address
     addr = supabase.table("customer_addresses").select("*").eq("id", req.shipping_address_id).maybe_single().execute()
     if not addr.data:
         raise HTTPException(400, "Invalid shipping address")
 
-    # Get shipping method
     shipping_method = None
     if req.shipping_method_id:
         sm = supabase.table("shipping_methods").select("*").eq("id", req.shipping_method_id).maybe_single().execute()
         shipping_method = sm.data
 
-    # Calculate totals server-side
     calculated_subtotal = 0
     order_items = []
     for item in req.items:
@@ -607,7 +1004,7 @@ class NotificationRequest(BaseModel):
 
 @app.post("/api/notifications/send")
 async def send_notification(req: NotificationRequest):
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(
             "https://api.brevo.com/v3/smtp/email",
             headers={"api-key": BREVO_API_KEY, "Content-Type": "application/json"},
