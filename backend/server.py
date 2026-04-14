@@ -528,12 +528,17 @@ async def _send_otp_phone_email_fallback(phone: str, otp: str):
 # ══════════════════════════════════════════════════════════════
 
 def normalize_phone(phone: str) -> str:
-    p = phone.replace(" ", "").replace("-", "")
+    p = phone.replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
     if p.startswith("+91"):
         p = p[3:]
     elif p.startswith("91") and len(p) == 12:
         p = p[2:]
     return p
+
+
+def to_e164(phone_10_digit: str) -> str:
+    """Convert 10-digit Indian phone to E.164 format: +919876543210"""
+    return f"+91{phone_10_digit}"
 
 
 # ══════════════════════════════════════════════════════════════
@@ -869,7 +874,7 @@ async def verify_razorpay(req: VerifyPaymentRequest):
 
 
 # ══════════════════════════════════════════════════════════════
-# ORDER — Create
+# ORDER — Create (supports both guest + signed-in)
 # ══════════════════════════════════════════════════════════════
 
 class OrderItemInput(BaseModel):
@@ -878,29 +883,89 @@ class OrderItemInput(BaseModel):
     quantity: int
 
 class CreateOrderRequest(BaseModel):
-    customer_id: str
+    customer_id: str | None = None       # null for guest
     items: list[OrderItemInput]
-    shipping_address_id: str
+    shipping_address_id: str | None = None
+    shipping_address: dict | None = None  # inline address for guest
     shipping_method_id: str | None = None
     payment_mode: str = "online"
     coupon_code: str | None = None
+    # Guest fields
+    guest_phone: str | None = None
+    guest_name: str | None = None
+    guest_email: str | None = None
 
 
 @app.post("/api/order/create")
-async def create_order(req: CreateOrderRequest):
-    cust = supabase.table("customers").select("*").eq("id", req.customer_id).maybe_single().execute()
-    if not cust.data:
-        raise HTTPException(404, "Customer not found")
+async def create_order(req: CreateOrderRequest, request: Request):
+    now = datetime.now(timezone.utc)
+    is_guest = req.customer_id is None
 
-    addr = supabase.table("customer_addresses").select("*").eq("id", req.shipping_address_id).maybe_single().execute()
-    if not addr.data:
-        raise HTTPException(400, "Invalid shipping address")
+    # ── Resolve identity ──────────────────────────────────
+    if is_guest:
+        if not req.guest_phone:
+            raise HTTPException(400, "Phone number is required for guest checkout")
 
+        phone = normalize_phone(req.guest_phone)
+        if len(phone) != 10 or not phone.isdigit():
+            raise HTTPException(400, "Invalid phone number")
+
+        # Phone MUST have been verified via OTP before placing order
+        ip, _ = _extract_client_info(request)
+        otp_record = _get_otp(phone, "verify_phone")
+        # We check if the phone was recently verified by looking for a consumed OTP
+        # in the last 30 minutes (generous window for checkout flow)
+        phone_verified = False
+        if _tables_available():
+            try:
+                vr = (
+                    supabase.table("temp_otp")
+                    .select("id")
+                    .eq("identifier", phone)
+                    .eq("identifier_type", "phone")
+                    .eq("consumed", True)
+                    .gte("created_at", (now - timedelta(minutes=30)).isoformat())
+                    .limit(1)
+                    .execute()
+                )
+                phone_verified = bool(vr.data)
+            except Exception:
+                pass
+        else:
+            # In-memory fallback: check if any consumed phone OTP exists
+            for k, v in _mem_otps.items():
+                if k.endswith(f":{phone}") and v.get("consumed"):
+                    phone_verified = True
+                    break
+
+        if not phone_verified:
+            raise HTTPException(403, "Phone verification is required before placing an order. Please verify your phone first.")
+
+        normalized = to_e164(phone)
+        cust_data = None
+        addr_data = req.shipping_address or {}
+    else:
+        cust = supabase.table("customers").select("*").eq("id", req.customer_id).maybe_single().execute()
+        if not cust.data:
+            raise HTTPException(404, "Customer not found")
+        cust_data = cust.data
+        phone = normalize_phone(cust_data.get("phone") or "")
+        normalized = to_e164(phone) if len(phone) == 10 else None
+
+        addr_data = {}
+        if req.shipping_address_id:
+            addr = supabase.table("customer_addresses").select("*").eq("id", req.shipping_address_id).maybe_single().execute()
+            if not addr.data:
+                raise HTTPException(400, "Invalid shipping address")
+            addr_data = addr.data
+
+    # ── Shipping method ────────────────────────────────────
     shipping_method = None
     if req.shipping_method_id:
         sm = supabase.table("shipping_methods").select("*").eq("id", req.shipping_method_id).maybe_single().execute()
         shipping_method = sm.data
 
+    # ── Calculate totals server-side ───────────────────────
     calculated_subtotal = 0
     order_items = []
     for item in req.items:
@@ -938,13 +1003,16 @@ async def create_order(req: CreateOrderRequest):
             "is_refundable": True,
         })
 
+    if not order_items:
+        raise HTTPException(400, "No valid items in order")
+
     tax = calculated_subtotal * 0.18
     shipping_cost = float(shipping_method.get("base_rate", 0)) if shipping_method else 0
     cod_fee = float(shipping_method.get("cod_fee", 0)) if req.payment_mode == "cod" and shipping_method else 0
     total = calculated_subtotal + tax + shipping_cost + cod_fee
 
+    # ── Build order row ────────────────────────────────────
     order_data = {
-        "customer_id": req.customer_id,
         "order_status": "pending",
         "payment_status": "cod_pending" if req.payment_mode == "cod" else "pending",
         "fulfillment_status": "unfulfilled",
@@ -952,20 +1020,44 @@ async def create_order(req: CreateOrderRequest):
         "is_cod": req.payment_mode == "cod",
         "cod_amount": total if req.payment_mode == "cod" else None,
         "shipping_method_id": req.shipping_method_id,
+        "shipping_method_snapshot": shipping_method,
         "currency": "INR",
         "subtotal": calculated_subtotal,
         "tax_total": tax,
         "shipping_total": shipping_cost,
         "cod_fee": cod_fee,
         "grand_total": total,
-        "name_snapshot": addr.data.get("full_name"),
-        "email_snapshot": cust.data.get("email"),
-        "phone_snapshot": addr.data.get("phone_number") or cust.data.get("phone"),
-        "billing_address_snapshot": addr.data,
-        "shipping_address_snapshot": addr.data,
-        "delivery_instructions": addr.data.get("delivery_instructions"),
-        "purchase_date": datetime.now(timezone.utc).isoformat(),
+        "billing_address_snapshot": addr_data,
+        "shipping_address_snapshot": addr_data,
+        "purchase_date": now.isoformat(),
     }
+
+    if is_guest:
+        order_data.update({
+            "customer_id": None,
+            "is_guest": True,
+            "guest_phone_verified": True,
+            "guest_phone_verified_at": now.isoformat(),
+            "phone_snapshot": normalized,
+            "name_snapshot": req.guest_name or addr_data.get("full_name"),
+            "email_snapshot": req.guest_email,
+            "guest_customer_data": {
+                "phone": normalized,
+                "phone_10": phone,
+                "name": req.guest_name,
+                "email": req.guest_email,
+            },
+            "delivery_instructions": addr_data.get("delivery_instructions"),
+        })
+    else:
+        order_data.update({
+            "customer_id": req.customer_id,
+            "is_guest": False,
+            "phone_snapshot": normalized or (addr_data.get("phone_number") or cust_data.get("phone")),
+            "name_snapshot": addr_data.get("full_name") or cust_data.get("full_name"),
+            "email_snapshot": cust_data.get("email"),
+            "delivery_instructions": addr_data.get("delivery_instructions"),
+        })
 
     order_res = supabase.table("orders").insert(order_data).execute()
     if not order_res.data:
@@ -979,9 +1071,9 @@ async def create_order(req: CreateOrderRequest):
     supabase.table("order_events").insert({
         "order_id": order["id"],
         "event_type": "order_placed",
-        "actor": "customer",
+        "actor": "customer" if not is_guest else "system",
         "actor_id": req.customer_id,
-        "notes": f"Order placed via website ({req.payment_mode})",
+        "notes": f"{'Guest o' if is_guest else 'O'}rder placed via website ({req.payment_mode})",
     }).execute()
 
     return {
@@ -990,7 +1082,406 @@ async def create_order(req: CreateOrderRequest):
         "orderNumber": order.get("order_number"),
         "total": total,
         "paymentMode": req.payment_mode,
+        "isGuest": is_guest,
     }
+
+
+# ══════════════════════════════════════════════════════════════
+# GUEST — Verify phone for checkout (purpose = "verify_phone")
+# ══════════════════════════════════════════════════════════════
+
+class GuestPhoneVerifyRequest(BaseModel):
+    phone: str
+
+class GuestPhoneOTPVerifyRequest(BaseModel):
+    phone: str
+    otp: str
+
+
+@app.post("/api/guest/verify-phone/send")
+async def guest_verify_phone_send(req: GuestPhoneVerifyRequest, request: Request):
+    """Send OTP for guest phone verification before checkout."""
+    phone = normalize_phone(req.phone)
+    if len(phone) != 10 or not phone.isdigit():
+        raise HTTPException(400, "Invalid phone number")
+
+    result = await send_otp(
+        identifier=phone,
+        identifier_type="phone",
+        purpose="verify_phone",
+        request=request,
+    )
+    return result
+
+
+@app.post("/api/guest/verify-phone/confirm")
+async def guest_verify_phone_confirm(req: GuestPhoneOTPVerifyRequest, request: Request):
+    """Verify OTP — marks phone as verified for guest checkout."""
+    phone = normalize_phone(req.phone)
+    otp = req.otp.strip()
+    if len(phone) != 10 or not otp or len(otp) != 6:
+        raise HTTPException(400, "Invalid phone or verification code")
+
+    verify_otp(
+        identifier=phone,
+        identifier_type="phone",
+        purpose="verify_phone",
+        plain_otp=otp,
+        request=request,
+    )
+
+    return {
+        "success": True,
+        "phone_verified": True,
+        "normalized_phone": to_e164(phone),
+        "message": "Phone verified. You can now place your order.",
+    }
+
+
+# ══════════════════════════════════════════════════════════════
+# GUEST — Fetch orders by phone (after login or as guest)
+# ══════════════════════════════════════════════════════════════
+
+class FetchGuestOrdersRequest(BaseModel):
+    phone: str
+
+class LinkGuestOrdersRequest(BaseModel):
+    phone: str
+    customer_id: str
+
+
+@app.post("/api/guest/orders")
+async def fetch_guest_orders(req: FetchGuestOrdersRequest):
+    """Fetch all guest orders by normalized phone. Phone is primary identity."""
+    phone = normalize_phone(req.phone)
+    if len(phone) != 10:
+        raise HTTPException(400, "Invalid phone number")
+
+    normalized = to_e164(phone)
+
+    # Match on phone_snapshot (E.164 format stored in orders)
+    res = (
+        supabase.table("orders")
+        .select("id, order_number, order_status, payment_status, grand_total, purchase_date, is_guest, name_snapshot, order_items(product_name_snapshot, quantity)")
+        .eq("phone_snapshot", normalized)
+        .order("purchase_date", desc=True)
+        .execute()
+    )
+
+    return {
+        "success": True,
+        "orders": res.data or [],
+        "count": len(res.data or []),
+    }
+
+
+@app.post("/api/guest/orders/link")
+async def link_guest_orders(req: LinkGuestOrdersRequest):
+    """
+    When a user signs in, link all previous guest orders by phone.
+    Sets linked_customer_id and is_guest = false.
+    Phone is primary identity — email mismatch is ignored.
+    """
+    phone = normalize_phone(req.phone)
+    if len(phone) != 10:
+        raise HTTPException(400, "Invalid phone number")
+
+    # Verify customer exists
+    cust = supabase.table("customers").select("id").eq("id", req.customer_id).maybe_single().execute()
+    if not cust.data:
+        raise HTTPException(404, "Customer not found")
+
+    normalized = to_e164(phone)
+
+    # Find all guest orders with this phone
+    guest_orders = (
+        supabase.table("orders")
+        .select("id")
+        .eq("phone_snapshot", normalized)
+        .eq("is_guest", True)
+        .is_("linked_customer_id", "null")
+        .execute()
+    )
+
+    linked_count = 0
+    if guest_orders.data:
+        order_ids = [o["id"] for o in guest_orders.data]
+        for oid in order_ids:
+            try:
+                supabase.table("orders").update({
+                    "linked_customer_id": req.customer_id,
+                    "is_guest": False,
+                }).eq("id", oid).execute()
+                linked_count += 1
+            except Exception as e:
+                logger.warning(f"Failed to link order {oid}: {e}")
+
+    return {
+        "success": True,
+        "linked_count": linked_count,
+        "message": f"Linked {linked_count} previous guest order(s) to your account.",
+    }
+
+
+# ══════════════════════════════════════════════════════════════
+# REVIEWS — Secure review system (guest + signed-in)
+# ══════════════════════════════════════════════════════════════
+
+class CreateReviewRequest(BaseModel):
+    product_id: str
+    variant_id: str | None = None
+    rating: int
+    title: str | None = None
+    body: str | None = None
+    image_urls: list[str] = []
+    # Identity — one of these is required
+    customer_id: str | None = None     # signed-in user
+    guest_phone: str | None = None     # guest user
+
+
+@app.post("/api/reviews/create")
+async def create_review(req: CreateReviewRequest, request: Request):
+    """
+    Secure review creation.
+
+    Guest:  must have ordered the product (matched by phone + order_items).
+            Sets verified_purchase=true, is_guest_review=true, verified_via_phone=true.
+
+    Signed-in: can review any product.
+               Sets verified_purchase=true ONLY if they actually ordered it.
+    """
+    if req.rating < 1 or req.rating > 5:
+        raise HTTPException(400, "Rating must be between 1 and 5")
+
+    is_guest = req.customer_id is None
+    now = datetime.now(timezone.utc)
+
+    if is_guest:
+        # ── Guest review flow ─────────────────────────────
+        if not req.guest_phone:
+            raise HTTPException(400, "Phone number is required for guest reviews")
+
+        phone = normalize_phone(req.guest_phone)
+        if len(phone) != 10:
+            raise HTTPException(400, "Invalid phone number")
+
+        normalized = to_e164(phone)
+
+        # PURCHASE VERIFICATION: guest must have ordered this product
+        has_purchased = False
+        matching_order_item_id = None
+        try:
+            purchase_check = (
+                supabase.table("orders")
+                .select("id, order_items(id, product_id_snapshot)")
+                .eq("phone_snapshot", normalized)
+                .eq("guest_phone_verified", True)
+                .execute()
+            )
+            if purchase_check.data:
+                for order in purchase_check.data:
+                    for item in (order.get("order_items") or []):
+                        if item.get("product_id_snapshot") == req.product_id:
+                            has_purchased = True
+                            matching_order_item_id = item.get("id")
+                            break
+                    if has_purchased:
+                        break
+        except Exception as e:
+            logger.warning(f"Guest purchase check error: {e}")
+
+        if not has_purchased:
+            raise HTTPException(403, "Guest reviews require a verified purchase of this product.")
+
+        # Insert review
+        review_data = {
+            "product_id": req.product_id,
+            "variant_id": req.variant_id,
+            "customer_id": None,
+            "order_item_id": matching_order_item_id,
+            "rating": req.rating,
+            "title": req.title,
+            "body": req.body,
+            "image_urls": req.image_urls,
+            "verified_purchase": True,
+            "is_guest_review": True,
+            "verified_via_phone": True,
+            "status": "pending",
+        }
+
+    else:
+        # ── Signed-in user review flow ────────────────────
+        # Verify customer exists
+        cust = supabase.table("customers").select("id, phone").eq("id", req.customer_id).maybe_single().execute()
+        if not cust.data:
+            raise HTTPException(404, "Customer not found")
+
+        # SPAM CHECK: one review per product per customer
+        existing = (
+            supabase.table("product_reviews")
+            .select("id")
+            .eq("product_id", req.product_id)
+            .eq("customer_id", req.customer_id)
+            .limit(1)
+            .execute()
+        )
+        if existing.data:
+            raise HTTPException(409, "You have already reviewed this product.")
+
+        # PURCHASE VERIFICATION: check if customer actually ordered this product
+        has_purchased = False
+        matching_order_item_id = None
+        try:
+            purchase_check = (
+                supabase.table("orders")
+                .select("id, order_items(id, product_id_snapshot)")
+                .eq("customer_id", req.customer_id)
+                .not_.in_("order_status", ["cancelled", "failed"])
+                .execute()
+            )
+            if purchase_check.data:
+                for order in purchase_check.data:
+                    for item in (order.get("order_items") or []):
+                        if item.get("product_id_snapshot") == req.product_id:
+                            has_purchased = True
+                            matching_order_item_id = item.get("id")
+                            break
+                    if has_purchased:
+                        break
+        except Exception as e:
+            logger.warning(f"Purchase check error: {e}")
+
+        review_data = {
+            "product_id": req.product_id,
+            "variant_id": req.variant_id,
+            "customer_id": req.customer_id,
+            "order_item_id": matching_order_item_id,
+            "rating": req.rating,
+            "title": req.title,
+            "body": req.body,
+            "image_urls": req.image_urls,
+            "verified_purchase": has_purchased,
+            "is_guest_review": False,
+            "verified_via_phone": False,
+            "status": "pending",
+        }
+
+    # Insert
+    try:
+        res = supabase.table("product_reviews").insert(review_data).execute()
+        if not res.data:
+            raise HTTPException(500, "Failed to submit review")
+        review = res.data[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Review insert error: {e}")
+        raise HTTPException(500, "Failed to submit review")
+
+    return {
+        "success": True,
+        "reviewId": review["id"],
+        "verified_purchase": review_data["verified_purchase"],
+        "is_guest_review": review_data["is_guest_review"],
+        "message": "Review submitted for approval. Thank you!",
+    }
+
+
+# ══════════════════════════════════════════════════════════════
+# REVIEWS — Check eligibility (can this user/phone review?)
+# ══════════════════════════════════════════════════════════════
+
+class ReviewEligibilityRequest(BaseModel):
+    product_id: str
+    customer_id: str | None = None
+    guest_phone: str | None = None
+
+
+@app.post("/api/reviews/check-eligibility")
+async def check_review_eligibility(req: ReviewEligibilityRequest):
+    """
+    Pre-flight check: can this user review this product?
+    Returns eligibility status + whether it would be a verified purchase.
+    """
+    if not req.customer_id and not req.guest_phone:
+        raise HTTPException(400, "Either customer_id or guest_phone required")
+
+    if req.customer_id:
+        # Signed-in user: check for duplicate
+        try:
+            existing = (
+                supabase.table("product_reviews")
+                .select("id")
+                .eq("product_id", req.product_id)
+                .eq("customer_id", req.customer_id)
+                .limit(1)
+                .execute()
+            )
+            if existing.data:
+                return {"eligible": False, "reason": "You have already reviewed this product."}
+        except Exception:
+            pass
+
+        # Check verified purchase
+        has_purchased = False
+        try:
+            purchase_check = (
+                supabase.table("orders")
+                .select("id, order_items(product_id_snapshot)")
+                .eq("customer_id", req.customer_id)
+                .not_.in_("order_status", ["cancelled", "failed"])
+                .execute()
+            )
+            if purchase_check.data:
+                for order in purchase_check.data:
+                    for item in (order.get("order_items") or []):
+                        if item.get("product_id_snapshot") == req.product_id:
+                            has_purchased = True
+                            break
+                    if has_purchased:
+                        break
+        except Exception:
+            pass
+
+        return {
+            "eligible": True,
+            "verified_purchase": has_purchased,
+            "is_guest": False,
+        }
+
+    else:
+        phone = normalize_phone(req.guest_phone)
+        normalized = to_e164(phone)
+
+        # Guest: must have purchased
+        has_purchased = False
+        try:
+            purchase_check = (
+                supabase.table("orders")
+                .select("id, order_items(product_id_snapshot)")
+                .eq("phone_snapshot", normalized)
+                .eq("guest_phone_verified", True)
+                .execute()
+            )
+            if purchase_check.data:
+                for order in purchase_check.data:
+                    for item in (order.get("order_items") or []):
+                        if item.get("product_id_snapshot") == req.product_id:
+                            has_purchased = True
+                            break
+                    if has_purchased:
+                        break
+        except Exception:
+            pass
+
+        if not has_purchased:
+            return {"eligible": False, "reason": "Guest reviews require a verified purchase of this product."}
+
+        return {
+            "eligible": True,
+            "verified_purchase": True,
+            "is_guest": True,
+        }
 
 
 # ══════════════════════════════════════════════════════════════
