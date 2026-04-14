@@ -276,19 +276,22 @@ async def send_phone_otp(req: PhoneOTPRequest):
                 logger.warning(f"WhatsApp API error: {resp.text}")
 
     # Also send via Brevo email if customer has email
-    cust_res = supabase.table("customers").select("email").eq("phone", phone).maybe_single().execute()
-    if cust_res.data and cust_res.data.get("email") and "@" in cust_res.data["email"]:
-        async with httpx.AsyncClient() as client:
-            await client.post(
-                "https://api.brevo.com/v3/smtp/email",
-                headers={"api-key": BREVO_API_KEY, "Content-Type": "application/json"},
-                json={
-                    "sender": {"name": "YA Commerce", "email": BREVO_SENDER_EMAIL},
-                    "to": [{"email": cust_res.data["email"]}],
-                    "subject": "Your Phone Verification Code - YA Commerce",
-                    "htmlContent": f"<h2>Your code: <strong>{otp}</strong></h2><p>Expires in 5 minutes.</p>",
-                }
-            )
+    try:
+        cust_res = supabase.table("customers").select("email").eq("phone", phone).maybe_single().execute()
+        if cust_res.data and cust_res.data.get("email") and "@" in cust_res.data["email"] and "@yacommerce" not in cust_res.data["email"]:
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    "https://api.brevo.com/v3/smtp/email",
+                    headers={"api-key": BREVO_API_KEY, "Content-Type": "application/json"},
+                    json={
+                        "sender": {"name": "YA Commerce", "email": BREVO_SENDER_EMAIL},
+                        "to": [{"email": cust_res.data["email"]}],
+                        "subject": "Your Phone Verification Code - YA Commerce",
+                        "htmlContent": f"<h2>Your code: <strong>{otp}</strong></h2><p>Expires in 5 minutes.</p>",
+                    }
+                )
+    except Exception as e:
+        logger.warning(f"Email fallback error: {e}")
 
     return {"success": True, "message": "OTP sent via WhatsApp"}
 
