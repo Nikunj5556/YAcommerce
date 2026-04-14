@@ -1,25 +1,33 @@
-# Dockerfile
+# Use Node.js as the base image for the build stage
+FROM node:18 AS build
 
-# Use an official Node.js runtime as a parent image
-FROM node:14
+# Set the working directory
+WORKDIR /app
 
-# Set the working directory in the container
-WORKDIR /usr/src/app
+# Install pnpm globally
+RUN npm install -g pnpm
 
-# Copy package.json and package-lock.json
+# Copy the package files and install dependencies
 COPY package*.json ./
+RUN pnpm install
 
-# Install the app dependencies
-RUN npm install
-
-# Copy the application code
+# Copy the rest of the application code
 COPY . .
 
-# Build the app
-RUN npm run build
+# Build the application
+RUN pnpm build
 
-# Make the app available on a specific port
-EXPOSE 8080
+# Use a minimal Node.js image for production
+FROM node:18 AS production
 
-# Define the command to run the app
-CMD [ "npm", "start" ]
+# Set the working directory in the production image
+WORKDIR /app
+
+# Copy the build artifacts from the build stage
+COPY --from=build /app/dist ./dist
+
+# Expose the port the app runs on
+EXPOSE 3000
+
+# Serve the app using a simple server
+CMD ["npx", "serve", "-s", "dist", "-l", "3000"]
