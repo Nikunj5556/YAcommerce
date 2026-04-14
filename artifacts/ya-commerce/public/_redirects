@@ -1,0 +1,7 @@
+# Netlify redirects and rewrites
+
+# API routes to serverless functions
+/api/*  /.netlify/functions/:splat  200
+
+# SPA fallback - must be last
+/*  /index.html  200

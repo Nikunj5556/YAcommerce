@@ -1,0 +1,97 @@
+{
+  "theme_and_archetype": {
+    "domain": "E-commerce",
+    "theme": "Light",
+    "archetype": "4 (Swiss & High-Contrast)",
+    "vibe": "Objective, rigid, functional, premium. High-end e-commerce with a brutalist yet elegant edge."
+  },
+  "colors": {
+    "background_base": "#FFFFFF",
+    "background_secondary": "#F3F4F6",
+    "text_primary": "#0A0A0A",
+    "text_secondary": "#4B5563",
+    "accent_primary": "#000000",
+    "accent_secondary": "#002FA7",
+    "borders": "#E5E7EB",
+    "status": {
+      "success": "#16A34A",
+      "warning": "#F59E0B",
+      "error": "#DC2626"
+    },
+    "guidelines": "No muddy greys. High contrast. Accent color #002FA7 used sparingly for non-primary active states or highlights. Primary CTA buttons must be solid #000000 with #FFFFFF text."
+  },
+  "typography": {
+    "heading_font": "Outfit",
+    "body_font": "Outfit",
+    "heading_strategy": "Radical weight contrast. Headings are 'font-black' (900), body is 'font-light' (300). Tracking-tight on all headers above text-2xl.",
+    "sizes": {
+      "h1": "text-5xl sm:text-6xl tracking-tighter font-black",
+      "h2": "text-3xl sm:text-4xl tracking-tight font-bold",
+      "h3": "text-xl sm:text-2xl font-bold",
+      "body": "text-base font-light leading-relaxed",
+      "label": "text-xs tracking-[0.2em] uppercase font-bold text-gray-500"
+    }
+  },
+  "layout_and_spacing": {
+    "spacing_scale": "Generous. Use p-8 to p-16 for main sections. p-6 internal for cards.",
+    "grid_system": "Mode A (Tetris Grid) for Homepage. Asymmetric col spans (e.g., col-span-8 and col-span-4). Mode B for Dashboard/Account sections (strict, dense, functional).",
+    "alignment": "Strict left-alignment for all dense content, forms, and product details. Hero text can be left-aligned within a wide container."
+  },
+  "surface_strategies": {
+    "header": "Crystal Glass: bg-white/70 backdrop-blur-xl border-b border-black/5 shadow-sm. z-50 sticky top-0.",
+    "cards_products": "Flat solid background. 1px border-gray-200. NO SHADOW. Hover: border-gray-900.",
+    "footer": "Dark mode flip: bg-[#0A0A0A] text-white. py-24. Massive logo type text-[10vw] at the bottom."
+  },
+  "motion_and_interaction": {
+    "buttons": "hover:bg-gray-800 transition-colors duration-200. Focus: ring-2 ring-black ring-offset-2.",
+    "product_images": "group-hover:scale-105 transition-transform duration-700 ease-out.",
+    "lists": "Staggered fade-up for product grids."
+  },
+  "icons": {
+    "library": "@phosphor-icons/react",
+    "install_command": "npm install @phosphor-icons/react",
+    "usage": "Use Phophor icons with weight='regular' for UI elements, weight='duotone' for marketing sections."
+  },
+  "components_strategy": {
+    "marketing_pages": "Raw HTML/Tailwind for Hero, Grids, and Category layouts. No Shadcn wrappers to allow extreme asymmetry.",
+    "interactive_logic": "Shadcn UI for Dialogs, Select, Checkbox, Tabs. Strip default Vercel styles and match Swiss Brutalist look.",
+    "forms": "Strict Shadcn forms with square borders (rounded-none or max rounded-sm)."
+  },
+  "image_urls": {
+    "hero_background": {
+      "url": "https://images.pexels.com/photos/950241/pexels-photo-950241.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+      "description": "Minimalist white architectural interior, used as the background image for the main hero section. Put a bg-white/40 overlay to ensure text is readable."
+    },
+    "product_1": {
+      "url": "https://images.unsplash.com/photo-1772191530787-b9546da02fbc?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NTYxODF8MHwxfHNlYXJjaHwxfHxtaW5pbWFsaXN0JTIwaGlnaCUyMGVuZCUyMHByb2R1Y3QlMjB3aGl0ZSUyMGJhY2tncm91bmR8ZW58MHx8fHwxNzc2MTM3MTI0fDA&ixlib=rb-4.1.0&q=85",
+      "description": "White cream jar with gold accents. Use in product listing grid."
+    },
+    "product_2": {
+      "url": "https://images.unsplash.com/photo-1692521248622-98a1da77b673?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NTYxODF8MHwxfHNlYXJjaHw0fHxtaW5pbWFsaXN0JTIwaGlnaCUyMGVuZCUyMHByb2R1Y3QlMjB3aGl0ZSUyMGJhY2tncm91bmR8ZW58MHx8fHwxNzc2MTM3MTI0fDA&ixlib=rb-4.1.0&q=85",
+      "description": "Pair of earrings on a bowl. Use in product listing grid."
+    },
+    "category_fashion_1": {
+      "url": "https://images.unsplash.com/photo-1643320478404-a7a0785adb32?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1NzV8MHwxfHNlYXJjaHwxfHxmYXNoaW9uJTIwbW9kZWwlMjBlZGl0b3JpYWwlMjB3aGl0ZSUyMGJhY2tncm91bmR8ZW58MHx8fHwxNzc2MTM3MTI0fDA&ixlib=rb-4.1.0&q=85",
+      "description": "Woman in white dress. Use for 'Women's Fashion' category card."
+    },
+    "category_fashion_2": {
+      "url": "https://images.unsplash.com/photo-1758613653947-cfce6ae77b72?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1NzV8MHwxfHNlYXJjaHw0fHxmYXNoaW9uJTIwbW9kZWwlMjBlZGl0b3JpYWwlMjB3aGl0ZSUyMGJhY2tncm91bmR8ZW58MHx8fHwxNzc2MTM3MTI0fDA&ixlib=rb-4.1.0&q=85",
+      "description": "Makeup artist. Use for 'Beauty' or 'Accessories' category card."
+    },
+    "partner_logo": {
+      "url": "https://images.unsplash.com/photo-1746047420047-03fc7a9b9226?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1Mjh8MHwxfHNlYXJjaHwyfHxtaW5pbWFsaXN0JTIwYmxhY2slMjBicmFuZCUyMGxvZ298ZW58MHx8fHwxNzc2MTM3MTM2fDA&ixlib=rb-4.1.0&q=85",
+      "description": "Rivian logo on building. Use as a placeholder for partner brands in a 'Brands we carry' marquee."
+    }
+  },
+  "testing_requirements": "CRITICAL: All interactive and key informational elements MUST include a data-testid attribute. E.g., data-testid='checkout-submit-button'.",
+  "instructions_to_main_agent": [
+    "Read this JSON thoroughly. The archetype is 4 (Swiss & High-Contrast). Your primary layout strategy should be large typographic headers paired with dense, structured grids.",
+    "Do not invent new colors. Stick strictly to the monochrome palette defined, using #002FA7 only for subtle accents if absolutely necessary.",
+    "Implement the home page using custom CSS/HTML with Tailwind. Use Shadcn strictly for interactive pieces like dialogs, forms, dropdowns.",
+    "The Hero Section must have the architectural image overlaid with bg-white/40, making the h1 pop in stark black.",
+    "Add data-testid to every button, link, and form input without fail.",
+    "Install @phosphor-icons/react as specified.",
+    "For product cards, use the Tetris Grid for variations in size. Do not use equal sized cards everywhere.",
+    "Implement a marquee using react-fast-marquee with 'Brands we carry' using pure text and the partner logo provided."
+  ]
+}

@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite --config vite.config.ts --host 0.0.0.0",
     "build": "vite build --config vite.config.ts",
-    "serve": "vite preview --config vite.config.ts --host 0.0.0.0",
+    "serve": "vite preview --config vite.config.ts --host 0.0.0.0 --port ${PORT:-3000}",
+    "start": "npm run serve",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {
@@ -75,6 +76,8 @@
     "zod": "catalog:"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.103.0"
+    "@netlify/functions": "^2.8.2",
+    "@supabase/supabase-js": "^2.103.0",
+    "razorpay": "^2.9.4"
   }
 }
