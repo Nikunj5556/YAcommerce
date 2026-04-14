@@ -66,8 +66,24 @@ Build a production-ready, enterprise-grade, customer-facing eCommerce website ca
 - ✅ README.md
 
 ## Testing Results
-- Backend: 85.7% (6/7 passed - phone OTP expected to fail with placeholder WhatsApp keys)
-- Frontend: 100% (10/10 passed)
+- Backend: 100% (16/16 — all OTP endpoints, rate limiting, validation)
+- Frontend: 100% (8/8 — all UI elements and interactions)
+
+## What's Been Implemented (2026-04-14)
+
+### Secure OTP System (temp_otp + auth_rate_limit)
+- ✅ SHA-256 hashed OTP storage (never plain text)
+- ✅ Supabase `temp_otp` table integration (with in-memory fallback)
+- ✅ Supabase `auth_rate_limit` table integration (with in-memory fallback)
+- ✅ Rate limiting: max 5 requests per 10-minute window per identifier+action
+- ✅ Auto-block for 30 minutes when rate limit exceeded
+- ✅ Max 5 verification attempts per OTP
+- ✅ OTP expiry: 5 minutes
+- ✅ One-time use: consumed flag prevents reuse
+- ✅ IP address + user-agent logging
+- ✅ Expired OTP cleanup (housekeeping)
+- ✅ Remaining attempts shown in error messages
+- ✅ Block timestamp shown when rate-limited
 
 ## Prioritized Backlog
 ### P0 (Critical) - DONE
